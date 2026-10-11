@@ -1,6 +1,3 @@
-###Hey baby 🍼 If you leak this file under your own name and claim the credit, I'll fuck you with salt. 🥱
-
-
 import os
 import time
 import json
@@ -83,12 +80,11 @@ LoginRes = _globals["LoginRes"]
 
 MAIN_KEY = base64.b64decode("WWcmdGMlREV1aDYlWmNeOA==")
 MAIN_IV = base64.b64decode("Nm95WkRyMjJFM3ljaGpNJQ==")
-API_KEY = os.getenv("API_KEY", "")  # agar set hai to ?key=... zaroori hoga
+API_KEY = os.getenv("API_KEY", "")
 RELEASEVERSION = "OB55"
 USERAGENT = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
 LOGIN_URL = "https://loginbp.ppmainecoonghj.com/"
 
-# Fast HTTP client (connection pooling + keep-alive)
 HTTP_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=50)
 HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _http_client = httpx.Client(limits=HTTP_LIMITS, timeout=HTTP_TIMEOUT)
@@ -103,20 +99,20 @@ CORS(app)
 
 
 # ============================================================
-#  PART 4 — Helpers
+#  PART 4 — Helpers & Logic
 # ============================================================
 
 class AuthError(Exception):
-    """UID/password galat hai."""
+    pass
 
 class UpstreamError(Exception):
-    """Garena server ne sahi response nahi diya (timeout, rate limit, parse error)."""
+    pass
 
 class QueueError(Exception):
-    """Garena login queue (temporary) - dobara try karne par chal sakta hai."""
+    pass
 
 class AccountError(Exception):
-    """Account banned/blacklisted ya login queue me hai."""
+    pass
 
 
 def pad(text: bytes) -> bytes:
@@ -147,14 +143,12 @@ def try_parse_login_res(data: bytes):
 def extract_login_res(raw: bytes) -> dict:
     candidates = []
 
-    # Attempt 1: from index 0
     parsed = try_parse_login_res(raw)
     if parsed:
         if parsed.get("token"):
             return parsed
         candidates.append(parsed)
 
-    # Attempt 2: scan each \x08
     idx = 0
     while True:
         idx = raw.find(b"\x08", idx)
@@ -167,7 +161,6 @@ def extract_login_res(raw: bytes) -> dict:
             candidates.append(parsed)
         idx += 1
 
-    # Attempt 3: JWT marker prefix
     jwt_marker = raw.find(b"eyJhbGciOiJIUzI1NiIs")
     if jwt_marker != -1:
         for i in range(jwt_marker - 1, max(jwt_marker - 300, -1), -1):
@@ -180,10 +173,9 @@ def extract_login_res(raw: bytes) -> dict:
                 break
 
     if candidates:
-        # token wala nahi mila; sabse zyada fields wala parse wapas do (debug ke liye)
         return max(candidates, key=lambda m: len(m))
 
-    raise Exception(f"Could not parse LoginRes. Raw: {raw[:200]}")
+    raise ValueError(f"Could not parse LoginRes. Raw: {raw[:200]}")
 
 
 def get_access_token(account: str):
@@ -208,9 +200,9 @@ def get_access_token(account: str):
             if isinstance(data, dict):
                 return data.get("access_token", "0"), data.get("open_id", "0")
             last_err = "unexpected response from Garena"
-        except (httpx.HTTPError, ValueError) as e:  # timeout / network / non-JSON
+        except (httpx.HTTPError, ValueError) as e:
             last_err = str(e)
-        time.sleep(1.5 * (attempt + 1))
+        time.sleep(1.2 * (attempt + 1))
     raise UpstreamError(f"Garena access-token server error: {last_err}")
 
 
@@ -244,21 +236,26 @@ def generate_jwt_token(uid: str, password: str):
         "Ob_VeR": RELEASEVERSION,
     }
 
+    resp = None
     try:
         resp = _http_client.post(f"{LOGIN_URL}MajorLogin", data=payload, headers=headers)
-        msg = extract_login_res(resp.content)
     except httpx.HTTPError as e:
-        raise UpstreamError(f"MajorLogin request failed: {e}")
+        raise UpstreamError(f"MajorLogin connection error: {e}")
+
+    # Check for direct JSON error responses (account_not_found, banned, etc.)
+    try:
+        err_json = resp.json()
+        if isinstance(err_json, dict) and "type" in err_json:
+            raise AccountError(f"Garena: {err_json.get('type')} (status {resp.status_code})")
+    except AccountError:
+        raise
+    except Exception:
+        pass
+
+    try:
+        msg = extract_login_res(resp.content)
     except Exception as e:
-        try:
-            err_json = json.loads(resp.content)
-            if isinstance(err_json, dict) and err_json.get("type"):
-                raise AccountError(f"Garena: {err_json.get('type')} (status {resp.status_code})")
-        except AccountError:
-            raise
-        except Exception:
-            pass
-        raise UpstreamError(f"MajorLogin response parse failed (status {getattr(resp, 'status_code', '?')}): {str(e)[:150]}")
+        raise UpstreamError(f"MajorLogin response parse failed (status {resp.status_code}): {str(e)[:120]}")
 
     jwt_token = msg.get("token", "")
     if not jwt_token:
@@ -267,17 +264,15 @@ def generate_jwt_token(uid: str, password: str):
         if bl:
             raise AccountError(f"Account blacklisted/banned: {bl.get('banReason', 'UNKNOWN')}")
         if q:
-            raise QueueError(f"Login queue active, try later [queueInfo={json.dumps(q, default=str)[:120]}]")
-        fields = ",".join(sorted(k for k, v in msg.items() if v not in ("", 0, None, [], {})))
-        extra = ""
+            wait_secs = q.get("needWaitSecs", 0)
+            if wait_secs > 3600:
+                raise AccountError("Account locked in permanent server queue (needs manual game login)")
+            raise QueueError(f"Login queue active: wait {wait_secs}s")
         if msg.get("recommendRegions") or msg.get("newActiveRegion"):
-            extra = " (account ka region set nahi hai / region select karna baaki hai)"
-        raw_dbg = ""
-        if os.getenv("DEBUG_RAW"):
-            raw_dbg = f" raw_len={len(resp.content)} raw_hex={resp.content[:160].hex()}"
-        raise AccountError(
-            f"Login OK but server returned empty token{extra} [http={resp.status_code} fields={fields}{raw_dbg}]"
-        )
+            raise AccountError("Account has no active region set (requires in-game character creation)")
+
+        fields = ",".join(sorted(k for k, v in msg.items() if v not in ("", 0, None, [], {})))
+        raise AccountError(f"Login OK but server returned empty token [fields={fields}]")
 
     region = (msg.get("lockRegion") or msg.get("notiRegion") or "").upper() or None
     elapsed = time.time() - start_time
@@ -302,7 +297,6 @@ def index():
     return jsonify({
         "status": "ok",
         "endpoint": "/token?uid=UID&password=PASS",
-        "example": "/token?uid=18097039025&password=yourpass",
     }), 200
 
 
@@ -331,15 +325,8 @@ def get_jwt_token():
     except UpstreamError as e:
         return jsonify({"status": "error", "error": str(e)}), 502
     except Exception as e:
-        return jsonify({"status": "error", "error": f"Failed to generate token: {str(e)}"}), 500
+        return jsonify({"status": "error", "error": f"Internal error: {str(e)}"}), 500
 
-
-# ============================================================
-#  ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5002, debug=False)
-    
-    
-### Hey baby 🍼 If you leak this file under your own name and claim the credit, I'll fuck you with salt. 🥱
