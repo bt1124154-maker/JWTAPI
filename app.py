@@ -142,10 +142,14 @@ def try_parse_login_res(data: bytes):
 
 
 def extract_login_res(raw: bytes) -> dict:
+    candidates = []
+
     # Attempt 1: from index 0
     parsed = try_parse_login_res(raw)
     if parsed:
-        return parsed
+        if parsed.get("token"):
+            return parsed
+        candidates.append(parsed)
 
     # Attempt 2: scan each \x08
     idx = 0
@@ -155,7 +159,9 @@ def extract_login_res(raw: bytes) -> dict:
             break
         parsed = try_parse_login_res(raw[idx:])
         if parsed:
-            return parsed
+            if parsed.get("token"):
+                return parsed
+            candidates.append(parsed)
         idx += 1
 
     # Attempt 3: JWT marker prefix
@@ -165,8 +171,14 @@ def extract_login_res(raw: bytes) -> dict:
             if raw[i] == 0x42:
                 parsed = try_parse_login_res(raw[i:])
                 if parsed:
-                    return parsed
+                    if parsed.get("token"):
+                        return parsed
+                    candidates.append(parsed)
                 break
+
+    if candidates:
+        # token wala nahi mila; sabse zyada fields wala parse wapas do (debug ke liye)
+        return max(candidates, key=lambda m: len(m))
 
     raise Exception(f"Could not parse LoginRes. Raw: {raw[:200]}")
 
@@ -245,7 +257,13 @@ def generate_jwt_token(uid: str, password: str):
             raise AccountError(f"Account blacklisted/banned: {bl.get('banReason', 'UNKNOWN')}")
         if q and not q.get("allow", True):
             raise AccountError("Login queue full / not allowed, try later")
-        raise AccountError("Login OK but server returned empty token")
+        fields = ",".join(sorted(k for k, v in msg.items() if v not in ("", 0, None, [], {})))
+        extra = ""
+        if msg.get("recommendRegions") or msg.get("newActiveRegion"):
+            extra = " (account ka region set nahi hai / region select karna baaki hai)"
+        raise AccountError(
+            f"Login OK but server returned empty token{extra} [http={resp.status_code} fields={fields}]"
+        )
 
     region = (msg.get("lockRegion") or msg.get("notiRegion") or "").upper() or None
     elapsed = time.time() - start_time
