@@ -112,6 +112,9 @@ class AuthError(Exception):
 class UpstreamError(Exception):
     """Garena server ne sahi response nahi diya (timeout, rate limit, parse error)."""
 
+class QueueError(Exception):
+    """Garena login queue (temporary) - dobara try karne par chal sakta hai."""
+
 class AccountError(Exception):
     """Account banned/blacklisted ya login queue me hai."""
 
@@ -255,14 +258,17 @@ def generate_jwt_token(uid: str, password: str):
         q = msg.get("queueInfo") or {}
         if bl:
             raise AccountError(f"Account blacklisted/banned: {bl.get('banReason', 'UNKNOWN')}")
-        if q and not q.get("allow", True):
-            raise AccountError("Login queue full / not allowed, try later")
+        if q:
+            raise QueueError(f"Login queue active, try later [queueInfo={json.dumps(q, default=str)[:120]}]")
         fields = ",".join(sorted(k for k, v in msg.items() if v not in ("", 0, None, [], {})))
         extra = ""
         if msg.get("recommendRegions") or msg.get("newActiveRegion"):
             extra = " (account ka region set nahi hai / region select karna baaki hai)"
+        raw_dbg = ""
+        if os.getenv("DEBUG_RAW"):
+            raw_dbg = f" raw_len={len(resp.content)} raw_hex={resp.content[:160].hex()}"
         raise AccountError(
-            f"Login OK but server returned empty token{extra} [http={resp.status_code} fields={fields}]"
+            f"Login OK but server returned empty token{extra} [http={resp.status_code} fields={fields}{raw_dbg}]"
         )
 
     region = (msg.get("lockRegion") or msg.get("notiRegion") or "").upper() or None
@@ -312,6 +318,8 @@ def get_jwt_token():
         return jsonify({"status": "error", "error": str(e)}), 401
     except AccountError as e:
         return jsonify({"status": "error", "error": str(e)}), 403
+    except QueueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 503
     except UpstreamError as e:
         return jsonify({"status": "error", "error": str(e)}), 502
     except Exception as e:
