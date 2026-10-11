@@ -250,6 +250,14 @@ def generate_jwt_token(uid: str, password: str):
     except httpx.HTTPError as e:
         raise UpstreamError(f"MajorLogin request failed: {e}")
     except Exception as e:
+        try:
+            err_json = json.loads(resp.content)
+            if isinstance(err_json, dict) and err_json.get("type"):
+                raise AccountError(f"Garena: {err_json.get('type')} (status {resp.status_code})")
+        except AccountError:
+            raise
+        except Exception:
+            pass
         raise UpstreamError(f"MajorLogin response parse failed (status {getattr(resp, 'status_code', '?')}): {str(e)[:150]}")
 
     jwt_token = msg.get("token", "")
